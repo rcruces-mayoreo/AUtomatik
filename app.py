@@ -3,7 +3,7 @@ import pandas as pd
 import re
 import unicodedata
 import io
-
+from datetime import datetime  # <--- ASEGÚRATE DE QUE ESTA LÍNEA ESTÉ AQUÍ
 st.set_page_config(page_title="Auditoría Beval - Exportar a Excel", layout="wide")
 
 # --- FUNCIONES DE NORMALIZACIÓN ---
