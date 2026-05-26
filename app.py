@@ -13,7 +13,6 @@ def limpiar_texto(texto):
     return ''.join(c for c in unicodedata.normalize('NFKD', texto) if unicodedata.category(c) != 'Mn')
 
 st.title("📑 Conciliador Automático: CB vs CG")
-st.markdown("Busca Créditos en el Banco (CB) contra Débitos en Contabilidad (CG)")
 
 # --- CARGA DE ARCHIVOS ---
 col1, col2 = st.columns(2)
@@ -29,23 +28,35 @@ if file_cb and file_cg:
 
     try:
         # --- PROCESAMIENTO CB ---
-        # Columna E (índice 4) es Beneficiario
+        # Columna E (índice 4) es Beneficiario según tu descripción
+        # Columna B (índice 1) es Cuenta Bancaria
         df_cb['beneficiario_match'] = df_cb.iloc[:, 4].apply(limpiar_texto)
-        # Buscamos la columna que contenga "Crédito" o "Credito"
-        col_credito_cb = [c for c in df_cb.columns if 'credito' in c.lower()][0]
-        df_cb['monto_match'] = df_cb[col_credito_cb].fillna(0)
+        
+        # Buscamos la columna de Créditos en CB (suele ser la columna H o índice 7)
+        # Si el nombre exacto es 'Credito', lo usamos. Si no, tomamos la columna 8.
+        col_monto_cb = 'Credito' if 'Credito' in df_cb.columns else df_cb.columns[7]
+        df_cb['monto_match'] = pd.to_numeric(df_cb[col_monto_cb], errors='coerce').fillna(0)
 
         # --- PROCESAMIENTO CG ---
-        # Buscamos el nombre/beneficiario en CG (usualmente columna 'Beneficiario' o 'Cuenta')
-        # Intentamos detectar la columna de nombre en CG
-        col_nombre_cg = 'Beneficiario' if 'Beneficiario' in df_cg.columns else df_cg.columns[0]
-        df_cg['nombre_cg_match'] = df_cg[col_nombre_cg].apply(limpiar_texto)
+        # Buscamos 'Debito Bolivar' o 'Debito Local'
+        # Usamos una técnica para encontrar la columna aunque tenga espacios o mayúsculas
+        col_debito_cg = None
+        for col in df_cg.columns:
+            if 'debito' in col.lower():
+                col_debito_cg = col
+                break
         
-        # Intentamos detectar "Debito Bolivar" o "Debito Local"
-        col_debito_cg = [c for c in df_cg.columns if 'debito' in c.lower()][0]
-        df_cg['monto_cg_match'] = df_cg[col_debito_cg].fillna(0)
+        if not col_debito_cg:
+            st.error("No encontré la columna 'Debito' en el archivo de Contabilidad (CG).")
+            st.stop()
 
-        # --- CONCILIACIÓN (El Cruce) ---
+        # Limpiamos el nombre del beneficiario en CG (asumiendo que es la primera columna o se llama Beneficiario)
+        col_nom_cg = 'Beneficiario' if 'Beneficiario' in df_cg.columns else df_cg.columns[0]
+        df_cg['nombre_cg_match'] = df_cg[col_nom_cg].apply(limpiar_texto)
+        df_cg['monto_cg_match'] = pd.to_numeric(df_cg[col_debito_cg], errors='coerce').fillna(0)
+
+        # --- CONCILIACIÓN ---
+        # Solo cruzamos filas donde haya montos mayores a cero
         conciliados = pd.merge(
             df_cb[df_cb['monto_match'] > 0], 
             df_cg[df_cg['monto_cg_match'] > 0], 
@@ -54,20 +65,19 @@ if file_cb and file_cg:
             how='inner'
         )
 
-        # --- MOSTRAR RESULTADOS ---
-        st.success(f"✅ Se encontraron {len(conciliados)} coincidencias.")
+        # --- RESULTADOS EN PANTALLA ---
+        st.success(f"✅ Conciliación completada: {len(conciliados)} movimientos encontrados.")
         
-        tab1, tab2 = st.tabs(["Coincidencias (Conciliados)", "Pendientes"])
+        res1, res2 = st.tabs(["✅ Movimientos Conciliados", "❌ Pendientes en Banco"])
         
-        with tab1:
-            st.write("Movimientos que coinciden en Beneficiario y Monto:")
+        with res1:
             st.dataframe(conciliados)
             
-        with tab2:
-            st.info("Operaciones en Banco que no se encontraron en Contabilidad:")
+        with res2:
+            # Los que están en CB pero no en el cruce
             pendientes = df_cb[(df_cb['monto_match'] > 0) & (~df_cb['beneficiario_match'].isin(conciliados['beneficiario_match']))]
             st.dataframe(pendientes)
 
     except Exception as e:
-        st.error(f"Error técnico: {e}")
-        st.warning("Asegúrate de que los archivos tengan los encabezados correctos.")
+        st.error(f"Hubo un problema con la estructura de los archivos: {e}")
+        st.info("Revisa que los nombres de las columnas no hayan cambiado.")
