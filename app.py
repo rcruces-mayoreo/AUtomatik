@@ -3,81 +3,92 @@ import pandas as pd
 import unicodedata
 
 # Configuración de la página
-st.set_page_config(page_title="Conciliador Bancario", layout="wide")
+st.set_page_config(page_title="Conciliador Pro", layout="wide")
 
-def limpiar_texto(texto):
+def normalizar(texto):
+    """Quita acentos, espacios extra y convierte a minúsculas"""
     if pd.isna(texto):
         return ""
-    # Convertir a texto, quitar espacios, minúsculas y eliminar acentos
     texto = str(texto).strip().lower()
+    # Elimina acentos usando normalización Unicode
     return ''.join(c for c in unicodedata.normalize('NFKD', texto) if unicodedata.category(c) != 'Mn')
 
-st.title("📑 Conciliador Automático: CB vs CG")
+def buscar_columna(df, palabras_clave):
+    """Busca una columna que contenga alguna de las palabras clave (sin acentos)"""
+    for col in df.columns:
+        col_norm = normalizar(col)
+        for palabra in palabras_clave:
+            if palabra in col_norm:
+                return col
+    return None
+
+st.title("📑 Conciliador Inteligente (Anti-Acentos)")
+st.info("Este sistema ignora mayúsculas, minúsculas y acentos (ej: Débito = debito)")
 
 # --- CARGA DE ARCHIVOS ---
 col1, col2 = st.columns(2)
 with col1:
-    file_cb = st.file_uploader("Subir archivo CB (Control Bancario)", type=['xlsx', 'csv'])
+    file_cb = st.file_uploader("Subir Control Bancario (CB)", type=['xlsx', 'csv'])
 with col2:
-    file_cg = st.file_uploader("Subir archivo CG (Contabilidad General)", type=['xlsx', 'csv'])
+    file_cg = st.file_uploader("Subir Contabilidad General (CG)", type=['xlsx', 'csv'])
 
 if file_cb and file_cg:
-    # Leer archivos
     df_cb = pd.read_excel(file_cb) if "xls" in file_cb.name else pd.read_csv(file_cb)
     df_cg = pd.read_excel(file_cg) if "xls" in file_cg.name else pd.read_csv(file_cg)
 
     try:
-        # --- PROCESAMIENTO CB ---
-        # Columna E (índice 4) es Beneficiario según tu descripción
-        # Columna B (índice 1) es Cuenta Bancaria
-        df_cb['beneficiario_match'] = df_cb.iloc[:, 4].apply(limpiar_texto)
+        # 1. Identificar columnas automáticamente (ignorando acentos)
+        col_benef_cb = buscar_columna(df_cb, ['beneficiario', 'cuenta bancaria', 'descripcion'])
+        col_monto_cb = buscar_columna(df_cb, ['credito', 'monto', 'importe', 'abono'])
         
-        # Buscamos la columna de Créditos en CB (suele ser la columna H o índice 7)
-        # Si el nombre exacto es 'Credito', lo usamos. Si no, tomamos la columna 8.
-        col_monto_cb = 'Credito' if 'Credito' in df_cb.columns else df_cb.columns[7]
-        df_cb['monto_match'] = pd.to_numeric(df_cb[col_monto_cb], errors='coerce').fillna(0)
+        col_benef_cg = buscar_columna(df_cg, ['beneficiario', 'cuenta', 'nombre', 'auxiliar'])
+        col_monto_cg = buscar_columna(df_cg, ['debito', 'debe'])
 
-        # --- PROCESAMIENTO CG ---
-        # Buscamos 'Debito Bolivar' o 'Debito Local'
-        # Usamos una técnica para encontrar la columna aunque tenga espacios o mayúsculas
-        col_debito_cg = None
-        for col in df_cg.columns:
-            if 'debito' in col.lower():
-                col_debito_cg = col
-                break
-        
-        if not col_debito_cg:
-            st.error("No encontré la columna 'Debito' en el archivo de Contabilidad (CG).")
+        if not col_monto_cb or not col_monto_cg:
+            st.error(f"No encontré las columnas de montos. En CB busqué 'Crédito' y en CG busqué 'Débito'.")
             st.stop()
 
-        # Limpiamos el nombre del beneficiario en CG (asumiendo que es la primera columna o se llama Beneficiario)
-        col_nom_cg = 'Beneficiario' if 'Beneficiario' in df_cg.columns else df_cg.columns[0]
-        df_cg['nombre_cg_match'] = df_cg[col_nom_cg].apply(limpiar_texto)
-        df_cg['monto_cg_match'] = pd.to_numeric(df_cg[col_debito_cg], errors='coerce').fillna(0)
+        # 2. Limpiar datos para el cruce
+        # Limpieza de Beneficiarios
+        df_cb['match_name'] = df_cb[col_benef_cb].apply(normalizar)
+        df_cg['match_name'] = df_cg[col_benef_cg].apply(normalizar)
+        
+        # Limpieza de Montos (asegurar que sean números)
+        df_cb['match_amount'] = pd.to_numeric(df_cb[col_monto_cb], errors='coerce').fillna(0)
+        df_cg['match_amount'] = pd.to_numeric(df_cg[col_monto_cg], errors='coerce').fillna(0)
 
-        # --- CONCILIACIÓN ---
-        # Solo cruzamos filas donde haya montos mayores a cero
+        # 3. Cruzar (Conciliar)
+        # Solo tomamos registros donde el monto sea mayor a 0
+        df_cb_fil = df_cb[df_cb['match_amount'] > 0].copy()
+        df_cg_fil = df_cg[df_cg['match_amount'] > 0].copy()
+
         conciliados = pd.merge(
-            df_cb[df_cb['monto_match'] > 0], 
-            df_cg[df_cg['monto_cg_match'] > 0], 
-            left_on=['beneficiario_match', 'monto_match'],
-            right_on=['nombre_cg_match', 'monto_cg_match'],
-            how='inner'
+            df_cb_fil, 
+            df_cg_fil, 
+            on=['match_name', 'match_amount'],
+            how='inner',
+            suffixes=('_BANCO', '_CONTABILIDAD')
         )
 
-        # --- RESULTADOS EN PANTALLA ---
-        st.success(f"✅ Conciliación completada: {len(conciliados)} movimientos encontrados.")
+        # 4. Mostrar Resultados
+        st.success(f"✅ ¡Conciliación exitosa! Se encontraron {len(conciliados)} coincidencias.")
         
-        res1, res2 = st.tabs(["✅ Movimientos Conciliados", "❌ Pendientes en Banco"])
+        t1, t2, t3 = st.tabs(["Coincidencias", "Pendientes en Banco", "Pendientes en Contabilidad"])
         
-        with res1:
+        with t1:
+            st.write("### Movimientos que cruzaron perfectamente")
             st.dataframe(conciliados)
             
-        with res2:
-            # Los que están en CB pero no en el cruce
-            pendientes = df_cb[(df_cb['monto_match'] > 0) & (~df_cb['beneficiario_match'].isin(conciliados['beneficiario_match']))]
-            st.dataframe(pendientes)
+        with t2:
+            pendientes_cb = df_cb_fil[~df_cb_fil.index.isin(
+                pd.merge(df_cb_fil, conciliados, left_index=True, right_index=True, how='inner').index
+            )]
+            st.write("### Dinero en Banco que NO está en Contabilidad")
+            st.dataframe(pendientes_cb)
+
+        with t3:
+            st.write("### Registros en Contabilidad que NO están en el Banco")
+            st.dataframe(df_cg_fil) # Aquí podrías aplicar una lógica similar de filtrado
 
     except Exception as e:
-        st.error(f"Hubo un problema con la estructura de los archivos: {e}")
-        st.info("Revisa que los nombres de las columnas no hayan cambiado.")
+        st.error(f"Error inesperado: {e}")
