@@ -1,104 +1,113 @@
 import streamlit as st
 import pandas as pd
 import unicodedata
+import io
 
 # Configuración de página
 st.set_page_config(page_title="Conciliador SILLACA PRO", layout="wide")
 
 def normalizar(texto):
-    """Limpia texto: minúsculas, sin acentos, sin espacios extra"""
     if pd.isna(texto): return ""
     texto = str(texto).strip().lower()
     return ''.join(c for c in unicodedata.normalize('NFKD', texto) if unicodedata.category(c) != 'Mn')
 
-def identificar_moneda(referencia):
-    """Lógica 'SI' para detectar moneda"""
-    ref = str(referencia).upper()
-    return "VES" if "VES" in ref else "USD"
+def limpiar_dataframe(df):
+    """Detecta la fila de encabezados real buscando la palabra 'Asiento'"""
+    for i in range(len(df)):
+        fila = df.iloc[i].astype(str).apply(normalizar).tolist()
+        if 'asiento' in fila or 'fecha' in fila:
+            new_df = df.iloc[i+1:].copy()
+            new_df.columns = df.iloc[i].tolist()
+            return new_df.reset_index(drop=True)
+    return df
+
+def buscar_col(cols, posibles_nombres):
+    """Busca una columna por aproximación de nombre"""
+    for c in cols:
+        c_norm = normalizar(c)
+        if any(p in c_norm for p in posibles_nombres):
+            return c
+    return None
 
 st.title("🤖 Conciliador Inteligente SILLACA")
-st.markdown("---")
+st.info("Detectando automáticamente encabezados y moneda...")
 
-# 1. CARGA DE DOCUMENTOS
 col_a, col_b = st.columns(2)
 with col_a:
-    file_cb = st.file_uploader("📂 Documento CB (Control Bancario)", type=['xlsx', 'csv'])
+    file_cb = st.file_uploader("📂 Archivo CB (Banco)", type=['xlsx', 'csv'])
 with col_b:
-    file_cg = st.file_uploader("📂 Documento CG (Contabilidad General)", type=['xlsx', 'csv'])
+    file_cg = st.file_uploader("📂 Archivo CG (Contabilidad)", type=['xlsx', 'csv'])
 
 if file_cb and file_cg:
-    # Lectura de datos
-    df_cb = pd.read_excel(file_cb) if "xls" in file_cb.name else pd.read_csv(file_cb)
-    df_cg = pd.read_excel(file_cg) if "xls" in file_cg.name else pd.read_csv(file_cg)
-
+    # Leer archivos saltando posibles errores de formato
     try:
-        # --- PROCESAMIENTO CG (TU TABLA DINÁMICA) ---
-        # Identificamos columnas de CG (buscando 'debito', 'credito', 'local', 'dolar')
-        col_ref_cg = [c for c in df_cg.columns if normalizar(c) == 'referencia'][0]
-        col_dl = [c for c in df_cg.columns if 'debito local' in normalizar(c)][0]
-        col_cl = [c for c in df_cg.columns if 'credito local' in normalizar(c)][0]
-        col_dd = [c for c in df_cg.columns if 'debito' in normalizar(c) and 'dolar' in normalizar(c)][0]
-        col_cd = [c for c in df_cg.columns if 'credito' in normalizar(c) and 'dolar' in normalizar(c)][0]
+        df_cb_raw = pd.read_excel(file_cb) if "xls" in file_cb.name else pd.read_csv(file_cb)
+        df_cg_raw = pd.read_excel(file_cg) if "xls" in file_cg.name else pd.read_csv(file_cg)
+        
+        # Limpiar filas de título/basura
+        df_cb = limpiar_dataframe(df_cb_raw)
+        df_cg = limpiar_dataframe(df_cg_raw)
 
-        # Replicamos la Tabla Dinámica: Agrupar por Referencia y sumar
-        cg_pivot = df_cg.groupby(col_ref_cg).agg({
-            col_dl: 'sum', col_cl: 'sum',
-            col_dd: 'sum', col_cd: 'sum'
+        # 1. Identificar columnas clave (ahora más flexible)
+        c_ref_cg = buscar_col(df_cg.columns, ['referencia'])
+        c_dl_cg = buscar_col(df_cg.columns, ['debito ves', 'debito local'])
+        c_cl_cg = buscar_col(df_cg.columns, ['credito ves', 'credito local'])
+        c_dd_cg = buscar_col(df_cg.columns, ['debito dolar', 'debito divisa'])
+        c_cd_cg = buscar_col(df_cg.columns, ['credito dolar', 'credito divisa'])
+
+        c_ref_cb = buscar_col(df_cb.columns, ['referencia', 'numero'])
+        c_ben_cb = buscar_col(df_cb.columns, ['beneficiario'])
+        c_con_cb = buscar_col(df_cb.columns, ['concepto'])
+        c_deb_cb = buscar_col(df_cb.columns, ['debito', 'debe'])
+        c_cre_cb = buscar_col(df_cb.columns, ['credito', 'haber'])
+
+        # Validar que encontramos lo básico
+        if not c_ref_cg or not c_ben_cb:
+            st.error("No pude encontrar las columnas necesarias. Revisa los nombres en tus archivos.")
+            st.stop()
+
+        # 2. PROCESO DE TABLA DINÁMICA (Agrupar CG)
+        cg_pivot = df_cg.groupby(c_ref_cg).agg({
+            c_dl_cg: 'sum', c_cl_cg: 'sum',
+            c_dd_cg: 'sum', c_cd_cg: 'sum'
         }).reset_index()
-        cg_pivot['ref_clean'] = cg_pivot[col_ref_cg].apply(normalizar)
+        cg_pivot['ref_clean'] = cg_pivot[c_ref_cg].apply(normalizar)
 
-        # --- PROCESAMIENTO CB ---
-        # Identificar moneda en CB por la columna Referencia
-        col_ref_cb = [c for c in df_cb.columns if normalizar(c) == 'referencia'][0]
-        col_benef_cb = df_cb.columns[4] # Columna E
-        col_concep_cb = df_cb.columns[5] # Columna F
-        col_deb_cb = [c for c in df_cb.columns if 'debito' in normalizar(c)][0]
-        col_cre_cb = [c for c in df_cb.columns if 'credito' in normalizar(c)][0]
-
-        df_cb['moneda'] = df_cb[col_ref_cb].apply(identificar_moneda)
-        # Combinamos Beneficiario + Concepto para hacer match con la Referencia de CG
-        df_cb['match_text'] = (df_cb[col_benef_cb].astype(str) + " " + df_cb[col_concep_cb].astype(str)).apply(normalizar)
-        
-        # --- EL CRUCE (MATCHING) ---
-        conciliados = []
-        
-        for idx, fila in df_cb.iterrows():
-            moneda = fila['moneda']
-            monto_deb = fila[col_deb_cb]
-            monto_cre = fila[col_cre_cb]
-            texto_cb = fila['match_text']
-
-            # Buscamos en la 'Tabla Dinámica' de CG
-            # Si es crédito en CB, buscamos débito en CG y viceversa
-            if moneda == "VES":
-                match = cg_pivot[
-                    (cg_pivot['ref_clean'].str.contains(texto_cb) | (texto_cb in cg_pivot['ref_clean'].values)) &
-                    ((cg_pivot[col_dl] == monto_cre) | (cg_pivot[col_cl] == monto_deb))
-                ]
-            else: # USD
-                match = cg_pivot[
-                    (cg_pivot['ref_clean'].str.contains(texto_cb) | (texto_cb in cg_pivot['ref_clean'].values)) &
-                    ((cg_pivot[col_dd] == monto_cre) | (cg_pivot[col_cd] == monto_deb))
-                ]
+        # 3. CRUCE (Siguiendo tu lógica espejo)
+        resultados = []
+        for _, fila in df_cb.iterrows():
+            # Identificar moneda (si dice VES en la referencia de CB)
+            ref_texto = str(fila[c_ref_cb]).upper()
+            moneda = "VES" if "VES" in ref_texto else "USD"
             
-            if not match.empty:
-                conciliados.append({**fila.to_dict(), 'Status': '✅ Conciliado'})
+            # Montos en CB
+            m_deb_cb = float(str(fila[c_deb_cb]).replace(',','')) if pd.notna(fila[c_deb_cb]) and fila[c_deb_cb] != '-' else 0
+            m_cre_cb = float(str(fila[c_cre_cb]).replace(',','')) if pd.notna(fila[c_cre_cb]) and fila[c_cre_cb] != '-' else 0
+            
+            # Texto para buscar (Beneficiario + Concepto)
+            busqueda = normalizar(f"{fila[c_ben_cb]} {fila[c_con_cb]}")
+            
+            # Buscar en el pivote de CG
+            if moneda == "VES":
+                # CB Credito vs CG Debito (o viceversa)
+                match = cg_pivot[(cg_pivot['ref_clean'].str.contains(busqueda)) & 
+                                 ((cg_pivot[c_dl_cg] == m_cre_cb) | (cg_pivot[c_cl_cg] == m_deb_cb))]
             else:
-                conciliados.append({**fila.to_dict(), 'Status': '❌ Pendiente'})
+                match = cg_pivot[(cg_pivot['ref_clean'].str.contains(busqueda)) & 
+                                 ((cg_pivot[c_dd_cg] == m_cre_cb) | (cg_pivot[c_cd_cg] == m_deb_cb))]
+            
+            status = "✅ Conciliado" if not match.empty else "❌ Pendiente"
+            resultados.append({**fila.to_dict(), 'Status': status, 'Moneda Detectada': moneda})
 
-        # --- RESULTADOS ---
-        df_final = pd.DataFrame(conciliados)
+        # 4. MOSTRAR TABLAS
+        df_final = pd.DataFrame(resultados)
+        st.subheader("Resultados de la comparación")
+        st.dataframe(df_final)
         
-        st.header("📊 Resultado de la Conciliación")
-        met1, met2 = st.columns(2)
-        met1.metric("Conciliados", len(df_final[df_final['Status'] == '✅ Conciliado']))
-        met2.metric("Pendientes", len(df_final[df_final['Status'] == '❌ Pendiente']))
-
-        st.dataframe(df_final.drop(columns=['match_text']))
-
-        # Botón para descargar a Excel
-        csv = df_final.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Descargar Reporte Conciliado", csv, "conciliacion_final.csv", "text/csv")
+        # Descarga
+        output = io.BytesIO()
+        df_final.to_excel(output, index=False)
+        st.download_button("📥 Descargar Excel", output.getvalue(), "conciliacion.xlsx")
 
     except Exception as e:
-        st.error(f"Error en el proceso: {e}. Revisa que las columnas tengan los nombres indicados.")
+        st.error(f"Error técnico: {e}")
